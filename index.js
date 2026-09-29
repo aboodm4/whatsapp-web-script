@@ -1,9 +1,25 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
+const qrcodeTerminal = require('qrcode-terminal');
 const express = require('express');
 const bodyParser = require('body-parser');
 const fs = require('fs');
+const path = require('path');
 
+// ============================================================
+// منع السيرفر من الانهيار بسبب أخطاء Puppeteer غير المتوقعة
+// ============================================================
+process.on('unhandledRejection', (reason) => {
+  console.error('[WARN] Unhandled Rejection:', reason?.message || reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('[WARN] Uncaught Exception:', error?.message || error);
+});
+
+// ============================================================
+// Express Setup
+// ============================================================
 const app = express();
 app.use(bodyParser.json());
 app.use(express.static('public'));
@@ -15,46 +31,159 @@ app.use((req, res, next) => {
   next();
 });
 
-const SESSION_FILE = './session.json';
-
-// Use LocalAuth (recommended) — it will create a folder .wwebjs_auth for session
-const client = new Client({
-  authStrategy: new LocalAuth({ clientId: "whatsapp-session" }),
-  puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
-});
-
-// store last qr to serve via web
+// ============================================================
+// WhatsApp Client — Factory Pattern
+// ============================================================
+let client = null;
 let lastQrData = null;
+let isRecovering = false; // قفل لمنع استعادة متعددة في نفس الوقت
 
-client.on('qr', (qr) => {
-  console.log('QR RECEIVED');
-  console.log('\n=======================');
-  console.log('📱 Scan this QR code:');
-  console.log('=======================\n');
+const AUTH_PATH = path.join(__dirname, '.wwebjs_auth');
+const INIT_TIMEOUT_MS = 90000; // 90 ثانية كحد أقصى لانتظار QR أو ready
+let initTimer = null;
 
-  // عرض الـ QR بشكل نصي داخل التيرمنال
-  const qrcode = require('qrcode-terminal');
-  qrcode.generate(qr, { small: true });
+function createClient() {
+  const newClient = new Client({
+    authStrategy: new LocalAuth({ clientId: "whatsapp-session" }),
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+      ],
+      timeout: 60000,
+    },
+    webVersionCache: {
+      type: 'local',
+    },
+  });
 
-  console.log('\n(If you already scanned, wait until it says "WhatsApp client is ready!")\n');
-  lastQrData = qr;
-});
+  newClient.on('loading_screen', (percent, message) => {
+    console.log(`[LOADING] ${percent}% - ${message}`);
+  });
 
-client.on('ready', () => {
-  console.log('WhatsApp client is ready!');
+  newClient.on('qr', (qr) => {
+    console.log('[QR] New QR code received. Scan it with your WhatsApp app.');
+    qrcodeTerminal.generate(qr, { small: true });
+    lastQrData = qr;
+    // QR ظهر — لغي التايم آوت
+    clearInitTimeout();
+  });
+
+  newClient.on('authenticated', () => {
+    console.log('[AUTH] Client authenticated successfully.');
+  });
+
+  newClient.on('ready', () => {
+    console.log('[OK] WhatsApp client is ready and connected!');
+    lastQrData = null;
+    isRecovering = false;
+    clearInitTimeout();
+  });
+
+  newClient.on('auth_failure', (msg) => {
+    console.error('[ERROR] Auth failure:', msg);
+    clearInitTimeout();
+    recoverSession();
+  });
+
+  newClient.on('disconnected', (reason) => {
+    console.log('[WARN] Client disconnected:', reason);
+    clearInitTimeout();
+    recoverSession();
+  });
+
+  return newClient;
+}
+
+function clearInitTimeout() {
+  if (initTimer) {
+    clearTimeout(initTimer);
+    initTimer = null;
+  }
+}
+
+function startInitTimeout() {
+  clearInitTimeout();
+  initTimer = setTimeout(() => {
+    console.error('[TIMEOUT] client.initialize() took too long (90s). Recovering...');
+    recoverSession();
+  }, INIT_TIMEOUT_MS);
+}
+
+async function recoverSession() {
+  // منع تشغيل عمليات استعادة متعددة بنفس الوقت
+  if (isRecovering) {
+    console.log('[RECOVER] Recovery already in progress, skipping...');
+    return;
+  }
+  isRecovering = true;
   lastQrData = null;
+  clearInitTimeout();
+
+  console.log('[RECOVER] Starting session recovery...');
+
+  // محاولة تدمير العميل القديم بأمان
+  if (client) {
+    try {
+      await client.destroy();
+      console.log('[RECOVER] Old client destroyed.');
+    } catch (err) {
+      // هذا طبيعي — المتصفح ربما أُغلق قبل ما نوصل هون
+      console.log('[RECOVER] Destroy skipped (already closed):', err?.message);
+    }
+    client = null;
+  }
+
+  // مسح مجلد الجلسة التالفة
+  if (fs.existsSync(AUTH_PATH)) {
+    try {
+      fs.rmSync(AUTH_PATH, { recursive: true, force: true });
+      console.log('[RECOVER] Auth directory deleted.');
+    } catch (err) {
+      console.error('[RECOVER] Error deleting auth directory:', err?.message);
+    }
+  }
+
+  // إنشاء عميل جديد بالكامل بعد 3 ثوانٍ
+  console.log('[RECOVER] Reinitializing new client in 3 seconds...');
+  setTimeout(() => {
+    try {
+      client = createClient();
+      console.log('[RECOVER] New client created. Calling initialize()...');
+      startInitTimeout();
+      client.initialize().catch(err => {
+        console.error('[RECOVER] Initialize failed:', err?.message);
+        clearInitTimeout();
+        isRecovering = false;
+      });
+    } catch (err) {
+      console.error('[RECOVER] Create client failed:', err?.message);
+      isRecovering = false;
+    }
+  }, 3000);
+}
+
+// ============================================================
+// أول تشغيل
+// ============================================================
+client = createClient();
+console.log('[STARTUP] Client created. Calling initialize()...');
+startInitTimeout();
+client.initialize().catch(err => {
+  console.error('[STARTUP] Initial client.initialize() failed:', err?.message);
+  clearInitTimeout();
+  recoverSession();
 });
 
-client.on('auth_failure', (msg) => {
-  console.error('AUTH FAILURE', msg);
-});
-
-client.on('disconnected', (reason) => {
-  console.log('Client disconnected:', reason);
-});
-
-// start whatsapp client
-client.initialize();
+// ============================================================
+// API Routes
+// ============================================================
 
 // serve QR as png
 app.get('/qr', async (req, res) => {
@@ -83,7 +212,7 @@ app.get('/qr', async (req, res) => {
 app.get('/status', (req, res) => {
   res.json({
     status: 'ok',
-    ready: client.info ? true : false,
+    ready: client && client.info ? true : false,
     hasQr: !!lastQrData,
   });
 });
@@ -125,7 +254,7 @@ async function processQueue() {
     } catch (err) {
       reject({ ok: false, error: err?.message || 'Unknown send failure' });
     }
-    
+
     // تأخير إجباري بين كل رسالة ورسالة (1.5 ثانية) لحماية الرقم من الحظر
     if (messageQueue.length > 0) {
       await new Promise(r => setTimeout(r, 1500));
@@ -140,7 +269,7 @@ app.post('/send', async (req, res) => {
   const { to, message } = req.body;
   if (!to || !message) return res.status(400).json({ ok: false, error: 'to and message required' });
 
-  if (!client.info) {
+  if (!client || !client.info) {
     return res.status(503).json({ ok: false, error: 'WhatsApp client is not connected yet (ready=false).' });
   }
 
@@ -173,20 +302,16 @@ app.post('/send', async (req, res) => {
 
 app.post('/disconnect', async (req, res) => {
   try {
-    try {
-      await client.logout();
-    } catch (err) {
-      console.log('Logout warning:', err.message);
+    if (client) {
+      try {
+        await client.logout();
+      } catch (err) {
+        console.log('Logout warning:', err.message);
+      }
     }
 
-    await client.destroy();
-    lastQrData = null;
-
-    setTimeout(() => {
-      client.initialize().catch((error) => {
-        console.error('Reinitialize error:', error);
-      });
-    }, 1500);
+    // استعادة الجلسة (ستقوم بإنشاء عميل جديد)
+    await recoverSession();
 
     res.json({ ok: true, message: 'Disconnected. Reinitializing for new QR...' });
   } catch (err) {
