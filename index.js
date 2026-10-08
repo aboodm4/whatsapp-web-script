@@ -319,7 +319,7 @@ app.post('/disconnect', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 4001;
+const PORT = process.env.PORT || 4002;
 app.listen(PORT, () => {
   console.log('Express server listening on port', PORT);
 });
