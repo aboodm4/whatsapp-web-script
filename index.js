@@ -39,12 +39,15 @@ let lastQrData = null;
 let isRecovering = false; // قفل لمنع استعادة متعددة في نفس الوقت
 
 const AUTH_PATH = path.join(__dirname, '.wwebjs_auth');
-const INIT_TIMEOUT_MS = 90000; // 90 ثانية كحد أقصى لانتظار QR أو ready
+const INIT_TIMEOUT_MS = 180000; // 3 دقائق كحد أقصى لانتظار QR أو ready بدلاً من 90 ثانية
 let initTimer = null;
 
 function createClient() {
   const newClient = new Client({
     authStrategy: new LocalAuth({ clientId: "whatsapp-session" }),
+    authTimeoutMs: 180000, // منع خطأ المهلة 30000ms في سيرفرات الـ VPS
+    takeoverOnConflict: true,
+    takeoverTimeoutMs: 0,
     puppeteer: {
       headless: true,
       args: [
@@ -55,8 +58,12 @@ function createClient() {
         '--no-first-run',
         '--no-zygote',
         '--disable-gpu',
+        '--disable-extensions',
+        '--disable-renderer-backgrounding',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
       ],
-      timeout: 60000,
+      timeout: 180000,
     },
     webVersionCache: {
       type: 'local',
@@ -87,15 +94,15 @@ function createClient() {
   });
 
   newClient.on('auth_failure', (msg) => {
-    console.error('[ERROR] Auth failure:', msg);
+    console.error('[ERROR] Auth failure (session rejected):', msg);
     clearInitTimeout();
-    recoverSession();
+    recoverSession(true); // فشل حقيقي في المصادقة: مسح الجلسة لطلب QR جديد
   });
 
   newClient.on('disconnected', (reason) => {
-    console.log('[WARN] Client disconnected:', reason);
+    console.log('[WARN] Client disconnected (will reconnect preserving session):', reason);
     clearInitTimeout();
-    recoverSession();
+    recoverSession(false); // انقطاع مؤقت: لا تمسح الجلسة المخزنة!
   });
 
   return newClient;
@@ -111,12 +118,12 @@ function clearInitTimeout() {
 function startInitTimeout() {
   clearInitTimeout();
   initTimer = setTimeout(() => {
-    console.error('[TIMEOUT] client.initialize() took too long (90s). Recovering...');
-    recoverSession();
+    console.error('[TIMEOUT] client.initialize() took too long. Retrying without deleting session...');
+    recoverSession(false); // لا تمسح الجلسة المخزنة!
   }, INIT_TIMEOUT_MS);
 }
 
-async function recoverSession() {
+async function recoverSession(forceClean = false) {
   // منع تشغيل عمليات استعادة متعددة بنفس الوقت
   if (isRecovering) {
     console.log('[RECOVER] Recovery already in progress, skipping...');
@@ -126,7 +133,7 @@ async function recoverSession() {
   lastQrData = null;
   clearInitTimeout();
 
-  console.log('[RECOVER] Starting session recovery...');
+  console.log(`[RECOVER] Starting session recovery (forceClean=${forceClean})...`);
 
   // محاولة تدمير العميل القديم بأمان
   if (client) {
@@ -140,18 +147,18 @@ async function recoverSession() {
     client = null;
   }
 
-  // مسح مجلد الجلسة التالفة
-  if (fs.existsSync(AUTH_PATH)) {
+  // مسح مجلد الجلسة فقط إذا طُلب صراحة (عند تسجيل الخروج المتعمد أو auth_failure)
+  if (forceClean && fs.existsSync(AUTH_PATH)) {
     try {
       fs.rmSync(AUTH_PATH, { recursive: true, force: true });
-      console.log('[RECOVER] Auth directory deleted.');
+      console.log('[RECOVER] Auth directory deleted because forceClean=true.');
     } catch (err) {
       console.error('[RECOVER] Error deleting auth directory:', err?.message);
     }
   }
 
-  // إنشاء عميل جديد بالكامل بعد 3 ثوانٍ
-  console.log('[RECOVER] Reinitializing new client in 3 seconds...');
+  // إعادة المحاولة بالاحتفاظ بالجلسة المخزنة
+  console.log('[RECOVER] Reinitializing client in 3 seconds...');
   setTimeout(() => {
     try {
       client = createClient();
@@ -310,8 +317,8 @@ app.post('/disconnect', async (req, res) => {
       }
     }
 
-    // استعادة الجلسة (ستقوم بإنشاء عميل جديد)
-    await recoverSession();
+    // استعادة الجلسة ومسحها بالكامل لطلب كود QR جديد عند تسجيل الخروج المتعمد
+    await recoverSession(true);
 
     res.json({ ok: true, message: 'Disconnected. Reinitializing for new QR...' });
   } catch (err) {
