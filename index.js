@@ -11,10 +11,16 @@ const path = require('path');
 // ============================================================
 process.on('unhandledRejection', (reason) => {
   console.error('[WARN] Unhandled Rejection:', reason?.message || reason);
+  if (isDeadBrowserError(reason)) {
+    recoverFromDeadBrowser(reason?.message || reason);
+  }
 });
 
 process.on('uncaughtException', (error) => {
   console.error('[WARN] Uncaught Exception:', error?.message || error);
+  if (isDeadBrowserError(error)) {
+    recoverFromDeadBrowser(error?.message || error);
+  }
 });
 
 // ============================================================
@@ -91,6 +97,7 @@ function createClient() {
     lastQrData = null;
     isRecovering = false;
     clearInitTimeout();
+    watchPage(newClient);
   });
 
   newClient.on('auth_failure', (msg) => {
@@ -106,6 +113,56 @@ function createClient() {
   });
 
   return newClient;
+}
+
+// Chrome يقدر يقتل الصفحة ويترك كائن الجلسة حيّاً. client.info يبقى موجوداً
+// فيظهر واتساب "متصل" بينما كل إرسال يرمي: Attempted to use detached Frame.
+const DEAD_BROWSER_PATTERN = /detached Frame|Target closed|Session closed|Execution context was destroyed|Protocol error|page has been closed|browser has disconnected|Page crashed/i;
+
+function errorText(error) {
+  if (!error) return '';
+  if (typeof error === 'string') return error;
+  return String(error.message || error.error || '');
+}
+
+function isDeadBrowserError(error) {
+  return DEAD_BROWSER_PATTERN.test(errorText(error));
+}
+
+function isClientUsable() {
+  if (!client || !client.info || !client.pupPage) return false;
+  try {
+    if (typeof client.pupPage.isClosed === 'function' && client.pupPage.isClosed()) {
+      return false;
+    }
+    const frame = typeof client.pupPage.mainFrame === 'function'
+      ? client.pupPage.mainFrame()
+      : null;
+    return Boolean(frame) && frame.detached !== true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function recoverFromDeadBrowser(reason) {
+  console.error('[RECOVER] Browser frame is dead:', reason);
+  recoverSession(false);
+}
+
+function watchPage(activeClient) {
+  const page = activeClient.pupPage;
+  if (!page || page.__massarGuard) return;
+  page.__massarGuard = true;
+
+  page.on('error', (err) => {
+    if (client !== activeClient || isRecovering) return;
+    recoverFromDeadBrowser(err?.message || 'page crashed');
+  });
+
+  page.on('close', () => {
+    if (client !== activeClient || isRecovering) return;
+    recoverFromDeadBrowser('page closed');
+  });
 }
 
 function clearInitTimeout() {
@@ -188,6 +245,12 @@ client.initialize().catch(err => {
   recoverSession();
 });
 
+// إذا ماتت صفحة Chrome بدون حدث disconnected، لا ننتظر مستخدماً ليكتشف العطل.
+setInterval(() => {
+  if (isRecovering || !client || !client.info || isClientUsable()) return;
+  recoverFromDeadBrowser('watchdog found a detached browser frame');
+}, 30000);
+
 // ============================================================
 // API Routes
 // ============================================================
@@ -217,9 +280,13 @@ app.get('/qr', async (req, res) => {
 
 // simple health and send endpoint example
 app.get('/status', (req, res) => {
+  const usable = isClientUsable();
+  if (client && client.info && !usable) {
+    recoverFromDeadBrowser('status check found a detached browser frame');
+  }
   res.json({
     status: 'ok',
-    ready: client && client.info ? true : false,
+    ready: usable,
     hasQr: !!lastQrData,
   });
 });
@@ -259,7 +326,17 @@ async function processQueue() {
       const msg = await client.sendMessage(numberId, message, { sendSeen: false });
       resolve({ ok: true, id: msg ? (msg.id ? msg.id._serialized : null) : null, to: numberId });
     } catch (err) {
-      reject({ ok: false, error: err?.message || 'Unknown send failure' });
+      const failure = { ok: false, error: err?.message || 'Unknown send failure' };
+      if (isDeadBrowserError(err)) {
+        while (messageQueue.length > 0) {
+          messageQueue.shift().reject(failure);
+        }
+        isProcessingQueue = false;
+        recoverFromDeadBrowser(failure.error);
+        reject(failure);
+        return;
+      }
+      reject(failure);
     }
 
     // تأخير إجباري بين كل رسالة ورسالة (1.5 ثانية) لحماية الرقم من الحظر
@@ -276,7 +353,10 @@ app.post('/send', async (req, res) => {
   const { to, message } = req.body;
   if (!to || !message) return res.status(400).json({ ok: false, error: 'to and message required' });
 
-  if (!client || !client.info) {
+  if (!isClientUsable()) {
+    if (client && client.info) {
+      recoverFromDeadBrowser('send requested while the browser frame is detached');
+    }
     return res.status(503).json({ ok: false, error: 'WhatsApp client is not connected yet (ready=false).' });
   }
 
@@ -299,10 +379,12 @@ app.post('/send', async (req, res) => {
       });
       res.json(result);
     } catch (queueErr) {
+      if (isDeadBrowserError(queueErr)) recoverFromDeadBrowser(queueErr?.error || queueErr);
       res.status(500).json(queueErr);
     }
 
   } catch (err) {
+    if (isDeadBrowserError(err)) recoverFromDeadBrowser(err?.message || err);
     res.status(500).json({ ok: false, error: err?.message || 'Unknown send failure' });
   }
 });
