@@ -59,10 +59,11 @@ function createClient() {
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
+        '--disable-dev-shm-usage', // يمنع تعليق المتصفح في سيرفرات لينكس
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
+        '--single-process', // اختياري لتقليل استهلاك الرام
         '--disable-gpu',
         '--disable-extensions',
         '--disable-renderer-backgrounding',
