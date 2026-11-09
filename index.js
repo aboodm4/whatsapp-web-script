@@ -6,10 +6,13 @@ const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
 
+let shuttingDown = false;
+
 // ============================================================
 // منع السيرفر من الانهيار بسبب أخطاء Puppeteer غير المتوقعة
 // ============================================================
 process.on('unhandledRejection', (reason) => {
+  if (shuttingDown) return;
   console.error('[WARN] Unhandled Rejection:', reason?.message || reason);
   if (isDeadBrowserError(reason)) {
     recoverFromDeadBrowser(reason?.message || reason);
@@ -17,6 +20,7 @@ process.on('unhandledRejection', (reason) => {
 });
 
 process.on('uncaughtException', (error) => {
+  if (shuttingDown) return;
   console.error('[WARN] Uncaught Exception:', error?.message || error);
   if (isDeadBrowserError(error)) {
     recoverFromDeadBrowser(error?.message || error);
@@ -46,7 +50,125 @@ let isRecovering = false; // قفل لمنع استعادة متعددة في ن
 
 const AUTH_PATH = path.join(__dirname, '.wwebjs_auth');
 const INIT_TIMEOUT_MS = 180000; // 3 دقائق كحد أقصى لانتظار QR أو ready بدلاً من 90 ثانية
+const BROWSER_RECYCLE_MS = 24 * 60 * 60 * 1000;
+const BROWSER_RSS_CHECK_MS = 10 * 60 * 1000;
+const BROWSER_RSS_LIMIT_MB = 1400;
+const LOCK_PATH = path.join(__dirname, '.massar-whatsapp.lock');
 let initTimer = null;
+
+// كاش Chrome المؤقت فقط. IndexedDB فيه الجلسة، ومسحه بيفرض مزامنة كاملة أو تسجيل خروج.
+const DISPOSABLE_CACHE_DIRS = [
+  'Cache',
+  'Code Cache',
+  'GPUCache',
+  'Service Worker/CacheStorage',
+];
+
+function pruneBrowserCaches() {
+  const profile = path.join(AUTH_PATH, 'session-whatsapp-session', 'Default');
+  for (const dir of DISPOSABLE_CACHE_DIRS) {
+    fs.rmSync(path.join(profile, dir), { recursive: true, force: true });
+  }
+}
+
+function pidAlive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function takeSingleInstanceLock() {
+  if (fs.existsSync(LOCK_PATH)) {
+    const existing = Number(fs.readFileSync(LOCK_PATH, 'utf8'));
+    if (pidAlive(existing) && existing !== process.pid) {
+      console.error(`[LOCK] WhatsApp is already running as pid ${existing}. Exiting without opening Chrome.`);
+      process.exit(0);
+    }
+  }
+  fs.writeFileSync(LOCK_PATH, String(process.pid));
+}
+
+function releaseSingleInstanceLock() {
+  try {
+    if (Number(fs.readFileSync(LOCK_PATH, 'utf8')) === process.pid) {
+      fs.rmSync(LOCK_PATH, { force: true });
+    }
+  } catch {
+    // القفل انمسح أو العملية الثانية أخذته
+  }
+}
+
+function listProcesses() {
+  let entries = [];
+  try {
+    entries = fs.readdirSync('/proc');
+  } catch {
+    return [];
+  }
+
+  const processes = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const stat = fs.readFileSync(`/proc/${entry}/stat`, 'utf8');
+      const commEnd = stat.lastIndexOf(')');
+      if (commEnd === -1) continue;
+      const rest = stat.slice(commEnd + 2).split(' ');
+      const rssPages = Number(rest[21]);
+      processes.push({
+        pid: Number(entry),
+        ppid: Number(rest[1]),
+        rssMb: Number.isFinite(rssPages) ? (rssPages * 4096) / (1024 * 1024) : 0,
+      });
+    } catch {
+      // العملية انتهت أثناء القراءة
+    }
+  }
+  return processes;
+}
+
+function processTree(rootPid) {
+  const processes = listProcesses();
+  const children = new Map();
+  for (const proc of processes) {
+    if (!children.has(proc.ppid)) children.set(proc.ppid, []);
+    children.get(proc.ppid).push(proc);
+  }
+
+  const tree = [];
+  const stack = processes.filter((proc) => proc.pid === rootPid);
+  const seen = new Set();
+  while (stack.length) {
+    const proc = stack.pop();
+    if (!proc || seen.has(proc.pid)) continue;
+    seen.add(proc.pid);
+    tree.push(proc);
+    for (const child of children.get(proc.pid) || []) stack.push(child);
+  }
+  return tree;
+}
+
+function killProcessTree(rootPid) {
+  for (const proc of processTree(rootPid).reverse()) {
+    try {
+      process.kill(proc.pid, 'SIGKILL');
+    } catch {
+      // العملية انتهت
+    }
+  }
+}
+
+function browserPid(activeClient) {
+  try {
+    return activeClient?.pupBrowser?.process?.()?.pid || null;
+  } catch {
+    return null;
+  }
+}
 
 function createClient() {
   const newClient = new Client({
@@ -63,9 +185,12 @@ function createClient() {
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
-        '--single-process', // اختياري لتقليل استهلاك الرام
         '--disable-gpu',
         '--disable-extensions',
+        '--mute-audio',
+        '--disk-cache-size=33554432',
+        '--media-cache-size=1',
+        '--disable-features=Translate,BackForwardCache,MediaRouter',
         '--disable-renderer-backgrounding',
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
@@ -99,6 +224,18 @@ function createClient() {
     isRecovering = false;
     clearInitTimeout();
     watchPage(newClient);
+    // الإرسال لا يحتاج الظهور "متصل". هذا يخفف تحديثات الحالة ولا يوقف مزامنة واتساب ويب.
+    newClient.sendPresenceUnavailable().catch((err) => {
+      console.log('[PRESENCE] Could not set unavailable:', err?.message);
+    });
+  });
+
+  newClient.on('call', async (call) => {
+    try {
+      await call.reject();
+    } catch (err) {
+      console.log('[CALL] Reject skipped:', err?.message);
+    }
   });
 
   newClient.on('auth_failure', (msg) => {
@@ -183,7 +320,7 @@ function startInitTimeout() {
 
 async function recoverSession(forceClean = false) {
   // منع تشغيل عمليات استعادة متعددة بنفس الوقت
-  if (isRecovering) {
+  if (shuttingDown || isRecovering) {
     console.log('[RECOVER] Recovery already in progress, skipping...');
     return;
   }
@@ -193,7 +330,8 @@ async function recoverSession(forceClean = false) {
 
   console.log(`[RECOVER] Starting session recovery (forceClean=${forceClean})...`);
 
-  // محاولة تدمير العميل القديم بأمان
+  // destroy() أحياناً يترك Chrome شغال. نقتل شجرته حتى ما تتراكم النسخ مع الأشهر.
+  const orphanPid = browserPid(client);
   if (client) {
     try {
       await client.destroy();
@@ -204,6 +342,7 @@ async function recoverSession(forceClean = false) {
     }
     client = null;
   }
+  killProcessTree(orphanPid);
 
   // مسح مجلد الجلسة فقط إذا طُلب صراحة (عند تسجيل الخروج المتعمد أو auth_failure)
   if (forceClean && fs.existsSync(AUTH_PATH)) {
@@ -214,6 +353,8 @@ async function recoverSession(forceClean = false) {
       console.error('[RECOVER] Error deleting auth directory:', err?.message);
     }
   }
+
+  pruneBrowserCaches();
 
   // إعادة المحاولة بالاحتفاظ بالجلسة المخزنة
   console.log('[RECOVER] Reinitializing client in 3 seconds...');
@@ -234,9 +375,37 @@ async function recoverSession(forceClean = false) {
   }, 3000);
 }
 
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[SHUTDOWN] ${signal}. Closing Chrome before exit.`);
+  clearInitTimeout();
+  const orphanPid = browserPid(client);
+  if (client) {
+    try {
+      await client.destroy();
+    } catch (err) {
+      console.log('[SHUTDOWN] Destroy skipped:', err?.message);
+    }
+    client = null;
+  }
+  killProcessTree(orphanPid);
+  releaseSingleInstanceLock();
+  process.exit(0);
+}
+
+process.on('SIGINT', () => {
+  shutdown('SIGINT');
+});
+process.on('SIGTERM', () => {
+  shutdown('SIGTERM');
+});
+
 // ============================================================
 // أول تشغيل
 // ============================================================
+takeSingleInstanceLock();
+pruneBrowserCaches();
 client = createClient();
 console.log('[STARTUP] Client created. Calling initialize()...');
 startInitTimeout();
@@ -348,6 +517,31 @@ async function processQueue() {
 
   isProcessingQueue = false;
 }
+
+// Chrome يسرّب ذاكرة مع بقاء واتساب ويب مفتوحاً. الاستبدال يبقي الجلسة ويعيد بناء المتصفح خلال ثوانٍ.
+function scheduleRecycle(delayMs) {
+  setTimeout(() => {
+    const busy = isProcessingQueue || messageQueue.length > 0;
+    if (shuttingDown || isRecovering || busy || !client || !client.info) {
+      console.log('[RECYCLE] Browser recycle postponed.');
+      scheduleRecycle(busy ? 15 * 60 * 1000 : BROWSER_RECYCLE_MS);
+      return;
+    }
+    console.log('[RECYCLE] Recycling the browser to release leaked memory. Session is kept.');
+    recoverSession(false);
+    scheduleRecycle(BROWSER_RECYCLE_MS);
+  }, delayMs);
+}
+
+scheduleRecycle(BROWSER_RECYCLE_MS);
+
+setInterval(() => {
+  if (shuttingDown || isRecovering || isProcessingQueue || messageQueue.length > 0 || !client || !client.info) return;
+  const rssMb = processTree(browserPid(client)).reduce((sum, proc) => sum + proc.rssMb, 0);
+  if (rssMb < BROWSER_RSS_LIMIT_MB) return;
+  console.error(`[RECYCLE] Chrome is using ${Math.round(rssMb)}MB. Recycling without deleting the session.`);
+  recoverSession(false);
+}, BROWSER_RSS_CHECK_MS);
 
 // simple endpoint to send message (POST: {"to":"phone@c.us","message":"hello"})
 app.post('/send', async (req, res) => {
